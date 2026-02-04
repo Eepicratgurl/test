@@ -1,0 +1,150 @@
+import time
+import winsound
+import requests
+import pychrome
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+KEYWORDS = ["xy", "zy", "hqr"]
+POLL_SECONDS = 1.0
+HEARTBEAT_SECONDS = 300
+
+def zulu_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def alert_beep():
+    winsound.Beep(1200, 180)
+    winsound.Beep(1500, 180)
+    winsound.Beep(1800, 180)
+
+def toast_powershell(keyword: str):
+    def clean(s: str) -> str:
+        return (s or "").replace("&", "and").replace("<", "").replace(">", "").replace('"', "'")
+
+    keyword = clean(keyword)
+
+    ps = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml(@"
+<toast duration="short">
+  <visual>
+    <binding template="ToastGeneric">
+      <text>Keyword detected</text>
+      <text>{keyword}</text>
+    </binding>
+  </visual>
+</toast>
+"@)
+$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("KeywordAlert")
+$notifier.Show($toast)
+"""
+    subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        capture_output=True,
+        text=True
+    )
+
+def find_devtools_port(host="127.0.0.1", start=9222, end=9235, timeout=0.2):
+    for port in range(start, end + 1):
+        try:
+            r = requests.get(f"http://{host}:{port}/json", timeout=timeout)
+            if r.status_code == 200 and "application/json" in r.headers.get("content-type", "").lower():
+                return port
+        except requests.RequestException:
+            pass
+    return None
+
+def pick_tab_id(devtools_base_url: str):
+    data = requests.get(f"{devtools_base_url}/json", timeout=1.0).json()
+    for entry in data:
+        if entry.get("type") == "page" and (entry.get("url") or "").startswith("http"):
+            return entry.get("id"), entry.get("title"), entry.get("url")
+    for entry in data:
+        if entry.get("type") == "page":
+            return entry.get("id"), entry.get("title"), entry.get("url")
+    if data:
+        e = data[0]
+        return e.get("id"), e.get("title"), e.get("url")
+    return None, None, None
+
+def get_tab_by_id(browser: pychrome.Browser, wanted_id: str):
+    for t in browser.list_tab():
+        if t.__dict__.get("id") == wanted_id:
+            return t
+    return None
+
+def alert_print_red(keyword: str, url: str):
+    t = zulu_now()
+    print(f"[DETECTED] {keyword}", file=sys.stderr)
+    print(f"Time: {t}", file=sys.stderr)
+    print(f"URL: {url}", file=sys.stderr)
+
+def main():
+    print("[INIT] Looking for Chrome/Edge DevTools endpoint on localhost...")
+    port = find_devtools_port()
+    if port is None:
+        print("[ERROR] No DevTools port found on 127.0.0.1:9222-9235.")
+        return
+
+    base = f"http://127.0.0.1:{port}"
+    print(f"[OK] Found DevTools on {base}")
+
+    tab_id, tab_title, tab_url = pick_tab_id(base)
+    if not tab_id:
+        print("[ERROR] No tabs found. Open a webpage in the debug browser window.")
+        return
+
+    browser = pychrome.Browser(url=base)
+    tab = get_tab_by_id(browser, tab_id)
+    if tab is None:
+        print("[ERROR] Could not map tab id to a pychrome Tab object.")
+        return
+
+    print(f"[OK] Attaching to tab: {tab_title} | {tab_url}")
+    print("[OK] Monitoring for substrings: " + ", ".join(KEYWORDS))
+    print("[RUN] Running... Ctrl+C to stop.\n")
+
+    tab.start()
+    tab.Runtime.enable()
+
+    last_heartbeat = time.time()
+    prev_counts = {k.lower(): 0 for k in KEYWORDS}
+
+    try:
+        while True:
+            now = time.time()
+            if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                print(f"[HEARTBEAT] Still running at {zulu_now()}")
+                last_heartbeat = now
+
+            res = tab.Runtime.evaluate(expression="document.body ? document.body.innerText : ''")
+            text = (res.get("result", {}).get("value", "") or "").lower()
+
+            for kw in KEYWORDS:
+                k = kw.lower()
+                c = text.count(k)
+                delta = c - prev_counts.get(k, 0)
+
+                if delta > 0:
+                    alert_beep()
+                    toast_powershell(kw)
+                    alert_print_red(kw, tab_url or "")
+
+                prev_counts[k] = c
+
+            time.sleep(POLL_SECONDS)
+
+    except KeyboardInterrupt:
+        print("\n[STOP] Stopped.")
+    finally:
+        try:
+            tab.stop()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    main()
