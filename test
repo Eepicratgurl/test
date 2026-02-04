@@ -148,3 +148,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+taskkill /F /IM chrome.exe
+"%ProgramFiles%\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%TEMP%\chrome-debug-profile"
